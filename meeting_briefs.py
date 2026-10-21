@@ -8,7 +8,7 @@ Hourly job that:
      outside guest gets a brief; the label never blocks one.
   4. Counts their past meetings with the firm and researches them on the web
   5. Saves a Google Doc brief titled "Meeting Brief | <name or email> | <date, time>"
-  6. Emails the doc link to the bosses
+  6. Emails the doc link to the bosses who are in that meeting
 
 Because it runs every hour over a 26 hour window, normal meetings get briefed about
 a day ahead and last-minute bookings get picked up within the hour. Postgres tracks
@@ -38,7 +38,9 @@ Env vars:
   MAX_OUTSIDE_ATTENDEES  skip events with more outside guests than this (default 8, webinars/group invites)
   DEBUG_REASONS          set to 1 to log why each guest got the label they did (testing)
   BOSS_EMAILS            comma list of who gets the briefs
-  BRIEFS_FOLDER_ID       Drive folder shared with the bosses
+  BOSS_FOLDERS           each boss's own Drive folder, e.g.
+                         sarah@aletapartners.com:<folder-id>,alina@aletapartners.com:<folder-id>
+  BRIEFS_FOLDER_ID       fallback Drive folder for any boss not listed in BOSS_FOLDERS
   BOSS_TZ                default America/Los_Angeles
   LOOKAHEAD_HOURS        default 26
 
@@ -92,6 +94,11 @@ INTERNAL_EMAILS = {e.lower() for e in env_list("INTERNAL_EMAILS")}
 REBRIEF_DAYS = int(os.environ.get("REBRIEF_DAYS", "180"))
 BOSS_EMAILS = env_list("BOSS_EMAILS")
 BRIEFS_FOLDER_ID = os.environ.get("BRIEFS_FOLDER_ID", "")
+# boss email -> their Drive folder ID
+BOSS_FOLDERS = {
+    k.strip().lower(): v.strip()
+    for k, v in (pair.split(":", 1) for pair in env_list("BOSS_FOLDERS"))
+}
 BOSS_TZ = ZoneInfo(os.environ.get("BOSS_TZ", "America/Los_Angeles"))
 LOOKAHEAD = timedelta(hours=int(os.environ.get("LOOKAHEAD_HOURS", "26")))
 LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4o-mini")
@@ -106,6 +113,13 @@ KIND_LABEL = {"client": "Potential Client", "contractor": "Potential Contractor"
 MAX_OUTSIDE_ATTENDEES = int(os.environ.get("MAX_OUTSIDE_ATTENDEES", "8"))
 HISTORY_DAYS = 90
 NEW_CONTACT_MAX_MEETINGS = int(os.environ.get("NEW_CONTACT_MAX_MEETINGS", "2"))
+
+# Firm shorthand the bosses use. Add more lines anytime: "ABBR": "what it means"
+GLOSSARY = {
+    "MBB": "McKinsey & Company, Bain & Company, and Boston Consulting Group (BCG), the top three strategy consulting firms",
+    "Big 4": "Deloitte, PwC, EY, and KPMG, the four largest accounting and professional services firms",
+}
+GLOSSARY_TEXT = "\n".join(f"- {k}: {v}" for k, v in GLOSSARY.items())
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +217,7 @@ def meeting_key(ev):
 
 
 def upcoming_events(calendar, now):
-    seen, events = set(), []
+    seen, events = {}, []
     for cal_id in CALENDAR_IDS:
         page_token = None
         while True:
@@ -225,8 +239,10 @@ def upcoming_events(calendar, now):
                     continue
                 key = meeting_key(ev)
                 if key in seen:  # same meeting on two bosses' calendars
+                    seen[key]["_calendars"].append(cal_id.lower())
                     continue
-                seen.add(key)
+                ev["_calendars"] = [cal_id.lower()]
+                seen[key] = ev
                 events.append(ev)
             page_token = resp.get("nextPageToken")
             if not page_token:
@@ -261,6 +277,14 @@ def outside_attendees(ev):
 def meeting_when(ev):
     start = datetime.fromisoformat(ev["start"]["dateTime"]).astimezone(BOSS_TZ)
     return start.strftime("%a %b %-d, %Y, %-I:%M %p %Z")
+
+
+def bosses_for(ev):
+    """Bosses who are in this meeting: invited, organizing, or it's on their calendar."""
+    involved = {a.get("email", "").lower() for a in ev.get("attendees", [])}
+    involved.add(ev.get("organizer", {}).get("email", "").lower())
+    involved.update(ev.get("_calendars", []))
+    return [b for b in BOSS_EMAILS if b.lower() in involved] or BOSS_EMAILS
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +417,10 @@ Context from recent emails:
 
 Search the web for their professional background. Try "{name} {company_hint} LinkedIn", their company website, articles, talks, GitHub, and similar public sources.
 
+Firm shorthand (the partners use these terms, so use them in the brief too):
+{glossary}
+If the person has worked at any of these firms, flag it near the top of the Snapshot using the shorthand, e.g. "Ex-MBB (McKinsey, 2015-2019)" or "Big 4 background (Deloitte)".
+
 Rules:
 - Only include facts you found in a source, with the source URL linked right next to each fact.
 - If you can't confirm something, list it under "Not found" instead of guessing.
@@ -422,6 +450,7 @@ def research(name, email, kind, ev, context, history):
         context=context or "(none)",
         company_hint="" if personal else domain.split(".")[0],
         history=history,
+        glossary=GLOSSARY_TEXT,
         third_section={
             "client": "Company (what their company does, size, industry, likely needs)",
             "contractor": "Skills and fit (what they could bring to the firm as a contractor)",
@@ -448,13 +477,12 @@ def build_doc_html(name, email, kind, ev, when, body, history):
 </body></html>"""
 
 
-def save_doc(drive, title, html):
-    """Uploads HTML and lets Drive convert it into a real Google Doc."""
+def save_doc(drive, title, html, folder_id):
     doc = drive.files().create(
         body={
             "name": title,
             "mimeType": "application/vnd.google-apps.document",
-            "parents": [BRIEFS_FOLDER_ID],
+            "parents": [folder_id],
         },
         media_body=MediaInMemoryUpload(html.encode("utf-8"), mimetype="text/html"),
         fields="id, webViewLink",
@@ -463,9 +491,9 @@ def save_doc(drive, title, html):
     return doc["webViewLink"]
 
 
-def send_email(gmail, subject, html):
+def send_email(gmail, to, subject, html):
     msg = MIMEText(html, "html")
-    msg["To"] = ", ".join(BOSS_EMAILS)
+    msg["To"] = ", ".join(to)
     msg["Subject"] = subject
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     gmail.users().messages().send(userId="me", body={"raw": raw}).execute()
@@ -510,14 +538,22 @@ def handle_event(conn, calendar, gmail, drive, ev, key, people, dry_run):
             body = research(name, email, kind, ev, contexts[email], history)
             html = build_doc_html(name, email, kind, ev, when, body, history)
 
+            bosses = bosses_for(ev)
+
             if dry_run:
-                log.info("[dry run] would create %r (%s; %s)\n%s", title, KIND_LABEL[kind], history, body[:1500])
+                log.info("[dry run] would create %r for %s (%s; %s)\n%s",
+                         title, ", ".join(bosses), KIND_LABEL[kind], history, body[:1500])
                 continue
 
-            link = save_doc(drive, title, html)
-            send_email(gmail, title, email_html(name, kind, ev, when, link))
-            mark_processed(conn, key, email, kind, link)
-            log.info("Briefed: %s", title)
+            links = []
+            for boss in bosses:
+                folder = BOSS_FOLDERS.get(boss.lower(), BRIEFS_FOLDER_ID)
+                link = save_doc(drive, title, html, folder)
+                send_email(gmail, [boss], title, email_html(name, kind, ev, when, link))
+                links.append(link)
+            mark_processed(conn, key, email, kind, links[0])
+            log.info("Briefed: %s -> %s", title, ", ".join(bosses))
+
         except Exception:
             log.exception("Failed on %s, will retry next run", email)
 
