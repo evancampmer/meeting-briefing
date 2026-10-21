@@ -115,7 +115,12 @@ PERSONAL_DOMAINS = {
     "live.com", "icloud.com", "me.com", "aol.com", "proton.me", "protonmail.com",
 }
 
-KIND_LABEL = {"client": "Potential Client", "contractor": "Potential Contractor", "contact": "Contact"}
+KIND_LABEL = {
+    "client": "Potential Client",
+    "contractor": "Potential Contractor",
+    "contact": "Contact",
+    "refresher": "Refresher",
+}
 MAX_OUTSIDE_ATTENDEES = int(os.environ.get("MAX_OUTSIDE_ATTENDEES", "8"))
 HISTORY_DAYS = 90
 NEW_CONTACT_MAX_MEETINGS = int(os.environ.get("NEW_CONTACT_MAX_MEETINGS", "2"))
@@ -459,7 +464,7 @@ def classify(ev, people, contexts):
     except Exception:
         log.warning("Labeling failed for %r, using 'contact'", ev.get("summary"))
         return "contact", {}
-    kind = data.get("kind") if data.get("kind") in KIND_LABEL else "contact"
+    kind = data.get("kind") if data.get("kind") in ("client", "contractor", "contact") else "contact"
     names = {k.lower(): v for k, v in (data.get("names") or {}).items() if v}
     if DEBUG_REASONS:
         log.info("Labeled %r as %s: %s", ev.get("summary"), kind, data.get("reason", "(no reason given)"))
@@ -484,8 +489,10 @@ def past_meetings(calendar, email, now):
     return len(seen)
 
 
-def history_line(count):
+def history_line(count, known=False):
     if count == 0:
+        if known:
+            return f"Known to the firm (in Notion), no meetings in the last {HISTORY_DAYS} days"
         return f"First meeting with the firm (no meetings in the last {HISTORY_DAYS} days)"
     return f"Met with the firm {count} time{'s' if count != 1 else ''} in the last {HISTORY_DAYS} days"
 
@@ -546,6 +553,7 @@ def research(name, email, kind, ev, context, history, notion=""):
         third_section={
             "client": "Company (what their company does, size, industry, likely needs)",
             "contractor": "Skills and fit (what they could bring to the firm as a contractor)",
+            "refresher": "What's new since the firm last connected (role changes, company news, launches)",
         }.get(kind, "Organization (what their company or organization does, and their role in it)"),
     )
     return strip_fences(ask(f"{LLM_MODEL}:online", prompt))  # :online = OpenRouter web search
@@ -564,7 +572,7 @@ def build_doc_html(name, email, kind, ev, when, body, history, notion_row=None):
         on_file = f"<h2>On file at the firm (Notion)</h2>\n<ul>{items}</ul>\n<hr>\n"
     return f"""<html><body>
 <h1>{escape(name)}</h1>
-<p><b>{KIND_LABEL[kind]}{" | Refresher" if notion_row else ""}</b></p>
+<p><b>{KIND_LABEL[kind]}</b></p>
 <p><b>Meeting:</b> {escape(when)} | {escape(ev.get('summary', '(no title)'))}<br>
 <b>Email:</b> {escape(email)}<br>
 <b>History:</b> {escape(history)}</p>
@@ -612,7 +620,7 @@ def handle_event(conn, calendar, gmail, drive, ev, key, people, dry_run, notion_
     now = datetime.now(timezone.utc)
     notion_rows = notion_rows or []
 
-    # Code decides who's new: skip anyone who's met the firm more than NEW_CONTACT_MAX_MEETINGS times
+    # Step 1, calendar: skip anyone who's met the firm more than NEW_CONTACT_MAX_MEETINGS times
     counts = {p["email"]: past_meetings(calendar, p["email"], now) for p in people}
     for p in people:
         c = counts[p["email"]]
@@ -632,31 +640,32 @@ def handle_event(conn, calendar, gmail, drive, ev, key, people, dry_run, notion_
         email = p["email"]
         name = p.get("displayName") or names.get(email) or email
         try:
+            # Step 2, Notion: only for people who passed the calendar check
             known = notion_match(notion_rows, email, name)
             if known and name == email and known["title"]:
                 name = known["title"]  # use the name from Notion when the invite has none
+            p_kind = "refresher" if known else kind
             label = "Meeting Brief (Refresher)" if known else "Meeting Brief"
             title = f"{label} | {name} | {when}"
 
-            history = history_line(counts[email])
-            body = research(name, email, kind, ev, contexts[email], history, notion_text(known))
-            html = build_doc_html(name, email, kind, ev, when, body, history, known)
+            history = history_line(counts[email], known=bool(known))
+            body = research(name, email, p_kind, ev, contexts[email], history, notion_text(known))
+            html = build_doc_html(name, email, p_kind, ev, when, body, history, known)
 
             bosses = bosses_for(ev)
 
             if dry_run:
-                log.info("[dry run] would create %r for %s (%s; %s%s)\n%s",
-                         title, ", ".join(bosses), KIND_LABEL[kind], history,
-                         "; found in Notion" if known else "", body[:1500])
+                log.info("[dry run] would create %r for %s (%s; %s)\n%s",
+                         title, ", ".join(bosses), KIND_LABEL[p_kind], history, body[:1500])
                 continue
 
             links = []
             for boss in bosses:
                 folder = BOSS_FOLDERS.get(boss.lower(), BRIEFS_FOLDER_ID)
                 link = save_doc(drive, title, html, folder)
-                send_email(gmail, [boss], title, email_html(name, kind, ev, when, link))
+                send_email(gmail, [boss], title, email_html(name, p_kind, ev, when, link))
                 links.append(link)
-            mark_processed(conn, key, email, kind, links[0])
+            mark_processed(conn, key, email, p_kind, links[0])
             log.info("Briefed: %s -> %s", title, ", ".join(bosses))
 
         except Exception:
