@@ -106,6 +106,11 @@ BOSS_FOLDERS = {
 NOTION_API_KEY = os.environ.get("NOTION_API_KEY", "")
 NOTION_DATABASE_ID = os.environ.get("NOTION_DATABASE_ID", "")
 BOSS_TZ = ZoneInfo(os.environ.get("BOSS_TZ", "America/Los_Angeles"))
+# boss email -> their time zone, e.g. sarah@aletapartners.com:America/Chicago
+BOSS_TZS = {
+    k.strip().lower(): ZoneInfo(v.strip())
+    for k, v in (pair.split(":", 1) for pair in env_list("BOSS_TZS"))
+}
 LOOKAHEAD = timedelta(hours=int(os.environ.get("LOOKAHEAD_HOURS", "26")))
 LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4o-mini")
 DEBUG_REASONS = os.environ.get("DEBUG_REASONS", "").lower() in {"1", "true", "yes"}
@@ -366,8 +371,8 @@ def outside_attendees(ev):
     return people
 
 
-def meeting_when(ev):
-    start = datetime.fromisoformat(ev["start"]["dateTime"]).astimezone(BOSS_TZ)
+def meeting_when(ev, tz=None):
+    start = datetime.fromisoformat(ev["start"]["dateTime"]).astimezone(tz or BOSS_TZ)
     return start.strftime("%a %b %-d, %Y, %-I:%M %p %Z")
 
 
@@ -634,7 +639,6 @@ def handle_event(conn, calendar, gmail, drive, ev, key, people, dry_run, notion_
 
     contexts = {p["email"]: email_context(gmail, p["email"]) for p in people}
     kind, names = classify(ev, people, contexts)
-    when = meeting_when(ev)
 
     for p in people:
         email = p["email"]
@@ -646,31 +650,35 @@ def handle_event(conn, calendar, gmail, drive, ev, key, people, dry_run, notion_
                 name = known["title"]  # use the name from Notion when the invite has none
             p_kind = "refresher" if known else kind
             label = "Meeting Brief (Refresher)" if known else "Meeting Brief"
-            title = f"{label} | {name} | {when}"
 
             history = history_line(counts[email], known=bool(known))
             body = research(name, email, p_kind, ev, contexts[email], history, notion_text(known))
-            html = build_doc_html(name, email, p_kind, ev, when, body, history, known)
-
-            bosses = bosses_for(ev)
-
-            if dry_run:
-                log.info("[dry run] would create %r for %s (%s; %s)\n%s",
-                         title, ", ".join(bosses), KIND_LABEL[p_kind], history, body[:1500])
-                continue
 
             links = []
-            for boss in bosses:
+            for boss in bosses_for(ev):
+                # Each boss gets the meeting time in her own time zone
+                when = meeting_when(ev, BOSS_TZS.get(boss.lower()))
+                title = f"{label} | {name} | {when}"
+                html = build_doc_html(name, email, p_kind, ev, when, body, history, known)
+
+                if dry_run:
+                    log.info("[dry run] would create %r for %s (%s; %s)",
+                             title, boss, KIND_LABEL[p_kind], history)
+                    continue
+
                 folder = BOSS_FOLDERS.get(boss.lower(), BRIEFS_FOLDER_ID)
                 link = save_doc(drive, title, html, folder)
                 send_email(gmail, [boss], title, email_html(name, p_kind, ev, when, link))
                 links.append(link)
-            mark_processed(conn, key, email, p_kind, links[0])
-            log.info("Briefed: %s -> %s", title, ", ".join(bosses))
+                log.info("Briefed: %s -> %s", title, boss)
+
+            if dry_run:
+                log.info("[dry run] brief preview for %s:\n%s", name, body[:1500])
+            elif links:
+                mark_processed(conn, key, email, p_kind, links[0])
 
         except Exception:
             log.exception("Failed on %s, will retry next run", email)
-
 
 def run(dry_run=False):
     now = datetime.now(timezone.utc)
