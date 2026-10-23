@@ -502,13 +502,16 @@ def history_line(count, known=False):
     return f"Met with the firm {count} time{'s' if count != 1 else ''} in the last {HISTORY_DAYS} days"
 
 
-RESEARCH_PROMPT = """Research this person ahead of a meeting with a small consulting firm.
+RESEARCH_PROMPT = """Research this person ahead of a meeting with Aleta Partners, a small US-based strategy and go-to-market consulting firm (partners in Chicago and Los Angeles) that works with growth companies, private equity firms and their portfolio companies, and independent consultants.
 
-Name: {name}
+Name on the invite: {name}
 Email: {email}
 Company website (from their email domain): {site}
 Meeting type: {kind_label}
 Meeting title: {title}
+Meeting description: {description}
+Organizer: {organizer}
+Other people on the invite: {others}
 History with the firm: {history}
 
 Context from recent emails:
@@ -518,7 +521,19 @@ What the firm already has on file about them (from its Notion database):
 {notion}
 If there is something on file, this person is already known to the firm and this brief is a REFRESHER. In that case, start the Snapshot with one line on how they're connected to the firm (based only on the Notion info), and focus on what has changed or is new since then (new roles, companies, launches, news). Talking points should build on the existing relationship.
 
-Search the web for their professional background. Try "{name} {company_hint} LinkedIn", their company website, articles, talks, GitHub, and similar public sources.
+How to search (do several searches before writing):
+1. The exact email in quotes: "{email}"
+2. The email username on its own: "{username}"
+3. "{name} {company_hint} LinkedIn", plus their company website if they have one
+4. Their name combined with any company or product names from the meeting title and description. These are only search hints: a word in the title may be the firm's own project or client, not theirs.
+5. Articles, talks, podcasts, GitHub, and similar public sources
+
+Identifying the right person:
+- Only use the EXACT spelling of their name. Similar spellings (e.g. Fiocchi vs Ficchi) are different people, so ignore them.
+- Use every clue to pick the right person: the meeting title and description, the other guests' companies, their email username, and fit with a US consulting firm like this one.
+- If you still can't tell which person it is, do NOT write full bios for several people. Instead, write a short "Possible matches" list (one line each, with a link and why it might or might not be them), keep every other section brief, and add a talking point that politely confirms who they are and what they do.
+- The meeting title and description are unverified hints, not facts. Never state something about the person just because it appears in the invite; only include it if an outside source confirms it.
+- Only rate confidence High if an outside source ties their exact name to their email, their email domain, or a company that also appears in the invite. Matching on a name alone is never High.
 
 Firm shorthand (the partners use these terms, so use them in the brief too):
 {glossary}
@@ -527,11 +542,11 @@ If the person has worked at any of these firms, flag it near the top of the Snap
 Rules:
 - Only include facts you found in a source, with the source URL linked right next to each fact. Facts from the Notion info can be cited as "(firm records)".
 - If you can't confirm something, list it under "Not found" instead of guessing.
-- If results might belong to a different person with the same name, say so clearly.
 - Professional info only: roles, employers, skills, education, public work. Nothing personal.
 
 Output an HTML fragment only (no <html>/<body> tags, no markdown, no code fences).
-The first element must be: <p><b>Confidence this is the right person:</b> High, Medium, or Low, plus one short reason</p>
+The FIRST element must be: <p><b>Full name:</b> their full name as confirmed by your sources, or Unconfirmed</p>
+The SECOND element must be: <p><b>Confidence this is the right person:</b> High, Medium, or Low, plus one short reason</p>
 Then these sections, each with an <h2> heading:
 Snapshot (2-3 sentences: who they are and their current role)
 Background (past roles, education, skills)
@@ -544,12 +559,20 @@ Sources (list of every URL used)"""
 def research(name, email, kind, ev, context, history, notion=""):
     domain = email.split("@")[-1]
     personal = domain in PERSONAL_DOMAINS
+    others = [
+        a.get("email", "") for a in ev.get("attendees", [])
+        if a.get("email", "").lower() != email and not a.get("resource")
+    ]
     prompt = RESEARCH_PROMPT.format(
-        name=name if name != email else "(unknown, search using the email and domain)",
+        name=name if name != email else "(not on the invite, search using the email and domain)",
         email=email,
+        username=email.split("@")[0],
         site="none (personal email address)" if personal else domain,
         kind_label=KIND_LABEL[kind],
         title=ev.get("summary", "(no title)"),
+        description=(ev.get("description") or "(none)")[:2000],
+        organizer=ev.get("organizer", {}).get("email", "(unknown)"),
+        others=", ".join(others) or "(none)",
         context=context or "(none)",
         company_hint="" if personal else domain.split(".")[0],
         history=history,
@@ -563,6 +586,17 @@ def research(name, email, kind, ev, context, history, notion=""):
     )
     return strip_fences(ask(f"{LLM_MODEL}:online", prompt))  # :online = OpenRouter web search
 
+
+def pull_name(body):
+    """Takes the 'Full name:' line off the top of the brief and returns (name or None, rest of brief)."""
+    m = re.search(r"<p>\s*<b>\s*Full name:\s*</b>(.*?)</p>", body, re.I | re.S)
+    if not m:
+        return None, body
+    found = re.sub(r"<[^>]+>", "", m.group(1)).strip()
+    rest = (body[:m.start()] + body[m.end():]).strip()
+    if not found or "@" in found or found.lower() in {"unconfirmed", "unknown", "not found"}:
+        return None, rest
+    return found, rest
 
 # ---------------------------------------------------------------------------
 # Output: Google Doc + email
@@ -653,7 +687,10 @@ def handle_event(conn, calendar, gmail, drive, ev, key, people, dry_run, notion_
 
             history = history_line(counts[email], known=bool(known))
             body = research(name, email, p_kind, ev, contexts[email], history, notion_text(known))
-
+            found_name, body = pull_name(body)
+            if found_name and name == email:
+                name = found_name  # e.g. alev@ameritfleet.com -> Adam Lev
+            
             links = []
             for boss in bosses_for(ev):
                 # Each boss gets the meeting time in her own time zone
